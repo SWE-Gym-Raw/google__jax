@@ -1069,7 +1069,7 @@ sharding_in_types = bool_state(
 
 use_direct_linearize = bool_state(
     name='jax_use_direct_linearize',
-    default=False,
+    default=True,
     help=('Use direct linearization instead JVP followed by partial eval'),
     include_in_jit_key=True)
 
