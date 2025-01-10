@@ -36,10 +36,12 @@
 #include "mlir/include/mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/include/mlir/IR/OpDefinition.h"
 #include "mlir/include/mlir/IR/Operation.h"
+#include "mlir/include/mlir/IR/PatternMatch.h"
 #include "mlir/include/mlir/IR/Region.h"
 #include "mlir/include/mlir/IR/Value.h"
 #include "mlir/include/mlir/Support/LLVM.h"
 #include "jaxlib/mosaic/dialect/tpu/tpu_dialect.h"
+#include "jaxlib/mosaic/dialect/tpu/vreg_util.h"
 
 namespace mlir::tpu {
 
@@ -515,6 +517,93 @@ LogicalResult canonicalize_select(int hardware_generation, Operation &raw_op) {
   return success();
 }
 
+// All conversions that change bitwidth must be canonicalized to tpu.fptosi.
+LogicalResult canonicalize_fptosi(int hardware_generation, Operation &raw_op) {
+  auto op = cast<arith::FPToSIOp>(raw_op);
+  ImplicitLocOpBuilder builder(op->getLoc(), op.getOperation());
+  auto src_vty = dyn_cast<VectorType>(op.getIn().getType());
+  auto dst_vty = dyn_cast<VectorType>(op.getType());
+  if (static_cast<bool>(src_vty) != static_cast<bool>(dst_vty)) {
+    return op.emitOpError("Vector/scalar mismatch between input and output");
+  }
+  bool is_vector = static_cast<bool>(src_vty);
+  unsigned src_bitwidth, dst_bitwidth;
+  if (is_vector) {
+    src_bitwidth = src_vty.getElementTypeBitWidth();
+    dst_bitwidth = dst_vty.getElementTypeBitWidth();
+  } else {
+    src_bitwidth = op.getIn().getType().getIntOrFloatBitWidth();
+    dst_bitwidth = op.getType().getIntOrFloatBitWidth();
+  }
+  if (dst_bitwidth > 32) {
+    return op.emitOpError("Target bitwidth too large");
+  }
+  if (is_vector && src_vty.getElementType().isBF16() &&
+      dst_vty.getElementType().isSignlessInteger(8)) {
+    auto new_op = builder.create<tpu::FPToSIOp>(
+        op.getType(), op.getIn(), tpu::RoundingMode::kTowardsZero);
+    op.replaceAllUsesWith(new_op.getResult());
+    op.erase();
+    // We briefly trigger canonicalization here to potentially fuse the rounding
+    // ops into the newly created tpu.fptosi.
+    {
+      PatternRewriter rewriter(new_op.getContext());
+      rewriter.setInsertionPoint(new_op);
+      // We don't care if the canonicalization pattern matched or not.
+      (void)tpu::FPToSIOp::canonicalize(new_op, rewriter);
+      new_op = nullptr;  // Canonicalization may have erased the op!
+    }
+    return success();
+  }
+  Value x = op.getIn();
+  // Upcast the input to f32.
+  if (src_bitwidth < 32) {
+    if (is_vector) {
+      x = builder.create<arith::ExtFOp>(
+          VectorType::get(src_vty.getShape(), builder.getF32Type()), x);
+    } else {
+      x = builder.create<arith::ExtFOp>(builder.getF32Type(), x);
+    }
+  }
+  if (dst_bitwidth < 32) {
+    // Need to clip values to match XLA
+    auto clip = [&](Value x, Value low, Value high) {
+      auto is_small =
+          builder.create<arith::CmpFOp>(arith::CmpFPredicate::OLT, x, low);
+      x = builder.create<arith::SelectOp>(is_small, low, x);
+      auto is_large =
+          builder.create<arith::CmpFOp>(arith::CmpFPredicate::OGT, x, high);
+      x = builder.create<arith::SelectOp>(is_large, high, x);
+      return x;
+    };
+    auto minval = builder.getF32FloatAttr(
+        APInt::getSignedMinValue(dst_bitwidth).getSExtValue());
+    auto maxval = builder.getF32FloatAttr(
+        APInt::getSignedMaxValue(dst_bitwidth).getSExtValue());
+    if (is_vector) {
+      auto x_vty = cast<VectorType>(x.getType());
+      x = clip(x, getFullVector(builder, x_vty, minval),
+               getFullVector(builder, x_vty, maxval));
+    } else {
+      auto f32 = builder.getF32Type();
+      x = clip(x, builder.create<arith::ConstantOp>(f32, minval),
+               builder.create<arith::ConstantOp>(f32, maxval));
+    }
+  }
+  if (is_vector) {
+    x = builder.create<arith::FPToSIOp>(
+        VectorType::get(src_vty.getShape(), builder.getI32Type()), x);
+  } else {
+    x = builder.create<arith::FPToSIOp>(builder.getI32Type(), x);
+  }
+  if (dst_bitwidth < 32) {
+    x = builder.create<arith::TruncIOp>(op.getType(), x);
+  }
+  op.replaceAllUsesWith(x);
+  op.erase();
+  return success();
+}
+
 LogicalResult canonicalize_repeat(int hardware_generation, Operation &raw_op) {
   auto op = dyn_cast<tpu::RepeatOp>(raw_op);
   if (!isa<VectorType>(op.getType())) {
@@ -549,6 +638,7 @@ const llvm::StringMap<canonicalize_rule_type> &rules() {
       {vector::MultiDimReductionOp::getOperationName(),
        canonicalize_multi_dim_reduction},
       {arith::SelectOp::getOperationName(), canonicalize_select},
+      {arith::FPToSIOp::getOperationName(), canonicalize_fptosi},
       {tpu::RepeatOp::getOperationName(), canonicalize_repeat}};
   return *rules;
 }
